@@ -14,7 +14,7 @@ pip install nopokedb
 from nopokedb import NoPokeDB
 
 # Initialize (or load existing) store
-db = PersistentVectorDB(dim=128, max_elements=10000, path="./vdb_data")
+db = NoPokeDB(dim=128, max_elements=10000, path="./vdb_data")
 
 # Add
 db.add(my_vector, metadata={"name": "foo"})
