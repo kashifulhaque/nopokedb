@@ -21,3 +21,8 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 # look in src/ for all packages
 where = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.4",
+]

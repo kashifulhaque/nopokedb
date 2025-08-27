@@ -3,6 +3,7 @@ import json
 import sqlite3
 import hnswlib
 import numpy as np
+from typing import Dict, List
 
 class NoPokeDB:
   """
@@ -63,6 +64,18 @@ class NoPokeDB:
     cur.execute("SELECT MAX(id) FROM metadata")
     row = cur.fetchone()
     return row[0] or -1
+  
+  def _fetch_metadata_bulk(self, ids: List[int]) -> Dict[int, dict]:
+    """
+    Fetch metadata for many ids in one shot. Returns {id: metadata}
+    """
+    if not ids:
+      return {}
+    
+    qmarks = ",".join("?" for _ in ids)
+    cur = self.conn.cursor()
+    cur.execute(f"SELECT id, data FROM metadata WHERE id IN ({qmarks})", ids)
+    return {int(i): json.loads(d) for i, d in cur.fetchall()}
 
   def add(self, vector: np.ndarray, metadata: dict):
     vector = np.asarray(vector, dtype=np.float32)
@@ -80,18 +93,34 @@ class NoPokeDB:
     self.conn.commit()
     return vid
 
-  def query(self, vector: np.ndarray, k: int = 5):
+  def query(self, vector: np.ndarray, k: int = 5, ef: int | None = None):
     vector = np.asarray(vector, dtype=np.float32)
     if vector.shape != (self.dim,):
       raise ValueError(f"Expected vector of shape ({self.dim},), got {vector.shape}")
+
+    # guard: empty index
+    current = self.index.get_current_count()
+    if current == 0:
+      raise RuntimeError("Index is empty. Add vectors before querying.")
+    
+    # cap k to available elements
+    k = min(max(1, k), current)
+
+    # optional per-call ef override (higher => better recall, slower)
+    if ef is not None:
+      self.index.set_ef(int(ef))
+    
     labels, distances = self.index.knn_query(vector.reshape(1, -1), k=k)
+    ids = [int(x) for x in labels[0] if x != -1]
+    md_map = self._fetch_metadata_bulk(ids)
+    
     results = []
     for lbl, dist in zip(labels[0], distances[0]):
+      if lbl == -1:
+        continue
       sim = 1.0 - dist  # cosine similarity
-      cur = self.conn.cursor()
-      cur.execute("SELECT data FROM metadata WHERE id = ?", (int(lbl),))
-      row = cur.fetchone()
-      md = json.loads(row[0]) if row else None
+      md = md_map.get(int(lbl))
+
       results.append({
         "id": int(lbl),
         "metadata": md,
@@ -105,6 +134,10 @@ class NoPokeDB:
     Metadata is auto-committed on each add.
     """
     self.index.save_index(self.index_path)
+    # atomic save: write to tmp and replace
+    tmp = self.index_path + ".tmp"
+    self.index.save_index(tmp)
+    os.replace(tmp, self.index_path)
 
   def close(self):
     """
