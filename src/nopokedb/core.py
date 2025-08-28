@@ -147,7 +147,25 @@ class NoPokeDB:
     if ef is not None:
       self.index.set_ef(int(ef))
 
-    labels, distances = self.index.knn_query(vector.reshape(1, -1), k=k)
+    # be resilient to deleted nodes / small ef: retry with larger ef once, then shrink k
+    tried_big_ef = False
+    while True:
+      try:
+        labels, distances = self.index.knn_query(vector.reshape(1, -1), k=k)
+        break
+      except RuntimeError as e:
+        msg = str(e).lower()
+        if ("contiguous" in msg or "ef" in msg) and not tried_big_ef:
+          # first retry: boost ef a lot
+          new_ef = max(getattr(self.index, "ef", 50), k * 8, 200)
+          self.index.set_ef(int(new_ef))
+          tried_big_ef = True
+          continue
+        # final fallback: reduce k if still failing
+        if k > 1:
+          k -= 1
+          continue
+        raise
     ids = [int(x) for x in labels[0] if x != -1]
     md_map = self._fetch_metadata_bulk(ids)
 
@@ -155,11 +173,82 @@ class NoPokeDB:
     for lbl, dist in zip(labels[0], distances[0]):
       if lbl == -1:
         continue
-      sim = 1.0 - dist  # cosine similarity
+
+      # score: higher is better across all spaces; always return raw distance too
+      d = float(dist)
+      if self.space == "cosine":
+        score = 1.0 - d
+      else:
+        # for l2/ip, hnswlib distances are "smaller is better"; flip sign for a monotone score
+        score = -d
+
       md = md_map.get(int(lbl))
 
-      results.append({"id": int(lbl), "metadata": md, "score": float(sim)})
+      results.append(
+        {"id": int(lbl), "metadata": md, "score": float(score), "distance": float(d)}
+      )
     return results
+
+  # ---- CRUD-ish helpers ----
+  def get(self, vid: int) -> dict | None:
+    """
+    Return stored metadata for id or None if not present.
+    """
+    cur = self.conn.cursor()
+    cur.execute("SELECT data FROM metadata WHERE id = ?", (int(vid),))
+    row = cur.fetchone()
+    return json.loads(row[0]) if row else None
+
+  def delete(self, vid: int) -> bool:
+    """
+    Delete an item:
+      - mark deleted in HNSW (ignored if not present)
+      - remove row from SQLite (returns True if something was removed)
+    """
+    with self._lock:
+      # mark_deleted is idempotent; ignore errors if id isn't present
+      try:
+        self.index.mark_deleted(int(vid))
+      except Exception:
+        pass
+      cur = self.conn.cursor()
+      cur.execute("DELETE FROM metadata WHERE id = ?", (int(vid),))
+      self.conn.commit()
+      return cur.rowcount > 0
+
+  def upsert(
+    self, vid: int, vector: np.ndarray | None = None, metadata: dict | None = None
+  ) -> None:
+    """
+    Upsert semantics:
+      - If metadata is provided: INSERT OR REPLACE metadata row for vid.
+      - If vector is provided:
+           if vid exists in index, mark_deleted then re-add same label with new vector
+           else add new point with this label.
+        Capacity will be ensured if this becomes a new insertion.
+    """
+    with self._lock:
+      if metadata is not None:
+        cur = self.conn.cursor()
+        cur.execute(
+          "INSERT INTO metadata (id, data) VALUES (?, ?) "
+          "ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+          (int(vid), json.dumps(metadata)),
+        )
+        self.conn.commit()
+
+      if vector is not None:
+        v = np.asarray(vector, dtype=np.float32)
+        if v.shape != (self.dim,):
+          raise ValueError(f"Expected vector of shape ({self.dim},), got {v.shape}")
+        # If vid is currently active, mark it deleted so we can reuse the label.
+        try:
+          self.index.mark_deleted(int(vid))
+        except Exception:
+          pass
+        # ensure capacity if adding a brand-new label (safe even if reusing)
+        self._ensure_capacity(1)
+        self.index.add_items(v.reshape(1, -1), np.array([int(vid)], dtype=np.int32))
 
   def save(self):
     """

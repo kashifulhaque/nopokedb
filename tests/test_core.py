@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from math import isclose
 from types import MethodType
 from nopokedb import NoPokeDB
 
@@ -176,3 +177,61 @@ def test_oplog_replay_index_only(tmp_path):
       db.close()
     except Exception:
       pass
+
+
+def test_multi_metric_cosine_normalization(tmp_path):
+  db = NoPokeDB(dim=3, max_elements=10, path=str(tmp_path), space="cosine")
+  try:
+    a = np.array([1.0, 0.0, 0.0], np.float32) * 10  # scaled
+    b = np.array([0.0, 1.0, 0.0], np.float32)
+    db.add(a, {"name": "a"})
+    db.add(b, {"name": "b"})
+    # query with differently scaled vector should still hit 'a' first due to normalization
+    q = np.array([2.0, 0.0, 0.0], np.float32)
+    res = db.query(q, k=2)
+    assert res[0]["metadata"]["name"] == "a"
+    # cosine score of identical dirs ~ 1.0
+    assert isclose(res[0]["score"], 1.0, rel_tol=1e-5)
+  finally:
+    db.close()
+
+
+def test_multi_metric_l2(tmp_path):
+  db = NoPokeDB(dim=2, max_elements=10, path=str(tmp_path), space="l2")
+  try:
+    db.add(np.array([0.0, 0.0], np.float32), {"id": "o"})
+    db.add(np.array([1.0, 0.0], np.float32), {"id": "x"})
+    res = db.query(np.array([0.1, 0.0], np.float32), k=2)
+    # closer to origin than to (1,0)
+    assert res[0]["metadata"]["id"] == "o"
+    # for non-cosine spaces, we expose distance and use score=-distance (monotonic)
+    assert "distance" in res[0] and isinstance(res[0]["distance"], float)
+  finally:
+    db.close()
+
+
+def test_delete_and_get_and_upsert(tmp_path):
+  db = NoPokeDB(dim=3, max_elements=10, path=str(tmp_path))
+  try:
+    v1 = np.array([1, 0, 0], np.float32)
+    v2 = np.array([0, 1, 0], np.float32)
+    id1 = db.add(v1, {"k": "v1"})
+    id2 = db.add(v2, {"k": "v2"})
+    # get
+    assert db.get(id1)["k"] == "v1"
+    # delete id2
+    assert db.delete(id2) is True
+    assert db.get(id2) is None
+    # ensure deleted one doesn't show up
+    res = db.query(v1, k=2)
+    assert all(r["id"] != id2 for r in res)
+    # upsert metadata only
+    db.upsert(id1, metadata={"k": "v1b", "x": 1})
+    assert db.get(id1)["k"] == "v1b"
+    # upsert vector (same id, different direction)
+    db.upsert(id1, vector=np.array([0, 0, 1], np.float32))
+    # should now be closer to [0,0,1]
+    nearer = db.query(np.array([0, 0, 1], np.float32), k=1)[0]
+    assert nearer["id"] == id1
+  finally:
+    db.close()
