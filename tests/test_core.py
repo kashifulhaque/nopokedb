@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
-import random
+
+from types import MethodType
 from nopokedb import NoPokeDB
 
 
@@ -91,6 +92,87 @@ def test_auto_resize_growth(tmp_path):
   finally:
     db.close()
 
+
 def test_invalid_vector_shape(db):
   with pytest.raises(ValueError):
     db.add([1, 2], metadata={})
+
+
+def test_oplog_replay_both_missing(tmp_path):
+  db = NoPokeDB(dim=4, max_elements=10, path=str(tmp_path))
+  try:
+    v = np.array([1, 0, 0, 0], np.float32)
+
+    # Replace ONLY this instance's add with a version that:
+    # - writes oplog
+    # - then raises before touching index/sqlite
+    def crash_after_oplog(self, vector, metadata):
+      vector = np.asarray(vector, np.float32)
+      assert vector.shape == (self.dim,)
+      with self._lock:
+        self._ensure_capacity(1)
+        vid = self._next_id
+        self._next_id += 1
+        # write-ahead intent
+        self._oplog_append(
+          {"t": "add", "id": int(vid), "vec": vector.tolist(), "md": metadata}
+        )
+        # boom before index.add_items / _insert_metadata
+        raise RuntimeError("simulated crash after oplog")
+
+    db.add = MethodType(crash_after_oplog, db)
+
+    with pytest.raises(RuntimeError):
+      db.add(v, {"name": "crashy"})
+
+    # At this point, oplog has the record, index/sqlite are untouched.
+    # "Restart" the DB; replay should make it whole.
+    db.close()
+    db2 = NoPokeDB(dim=4, max_elements=10, path=str(tmp_path))
+    try:
+      res = db2.query(v, k=1)
+      assert len(res) == 1
+      assert res[0]["metadata"]["name"] == "crashy"
+    finally:
+      db2.close()
+  finally:
+    try:
+      db.close()
+    except Exception:
+      pass
+
+
+def test_oplog_replay_index_only(tmp_path):
+  """
+  Simulate a crash after index.add_items succeeds and the index is saved,
+  but before metadata INSERT commits. On restart, replay should only insert metadata.
+  """
+  db = NoPokeDB(dim=4, max_elements=10, path=str(tmp_path))
+  try:
+    v = np.array([0, 1, 0, 0], np.float32)
+    # patch _insert_metadata to save index then raise
+    _original_insert = db._insert_metadata
+
+    def save_then_boom(vid, md):
+      # persist current index state to disk to simulate successful index write
+      db.save()
+      raise RuntimeError("simulated crash before metadata commit")
+
+    db._insert_metadata = save_then_boom
+    with pytest.raises(RuntimeError):
+      db.add(v, {"name": "half"})
+    # restart
+    db.close()
+    db2 = NoPokeDB(dim=4, max_elements=10, path=str(tmp_path))
+    try:
+      # replay should see id present in index but missing metadata, and insert md
+      res = db2.query(v, k=1)
+      assert len(res) == 1
+      assert res[0]["metadata"]["name"] == "half"
+    finally:
+      db2.close()
+  finally:
+    try:
+      db.close()
+    except Exception:
+      pass

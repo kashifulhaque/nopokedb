@@ -1,9 +1,11 @@
+import io
 import os
 import json
 import sqlite3
 import hnswlib
+import threading
 import numpy as np
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Iterable
 
 
 class NoPokeDB:
@@ -33,6 +35,8 @@ class NoPokeDB:
 
     self.index_path = os.path.join(self.path, "hnsw_index.bin")
     self.db_path = os.path.join(self.path, "metadata.db")
+    self.oplog_path = os.path.join(self.path, "oplog.jsonl")
+    self._lock = threading.RLock()
 
     self.index = hnswlib.Index(space=self.space, dim=self.dim)
     if os.path.exists(self.index_path):
@@ -46,6 +50,9 @@ class NoPokeDB:
     self.conn = sqlite3.connect(self.db_path)
     self._ensure_table()
     self._next_id = self._get_max_id() + 1
+
+    ### attempt to replay any pending ops (idempotent)
+    self._replay_oplog()
 
   def _ensure_table(self):
     cur = self.conn.cursor()
@@ -78,52 +85,50 @@ class NoPokeDB:
     return {int(i): json.loads(d) for i, d in cur.fetchall()}
 
   def add(self, vector: np.ndarray, metadata: dict):
-    vector = np.asarray(vector, dtype=np.float32)
-    if vector.shape != (self.dim,):
-      raise ValueError(f"Expected vector of shape ({self.dim},), got {vector.shape}")
-    self._ensure_capacity(1)
-    vid = self._next_id
-    self._next_id += 1
+    with self._lock:
+      vector = np.asarray(vector, dtype=np.float32)
+      if vector.shape != (self.dim,):
+        raise ValueError(f"Expected vector of shape ({self.dim},), got {vector.shape}")
+      self._ensure_capacity(1)
+      vid = self._next_id
+      self._next_id += 1
 
-    self.index.add_items(vector.reshape(1, -1), np.array([vid], dtype=int))
-    cur = self.conn.cursor()
-    cur.execute(
-      "INSERT INTO metadata (id, data) VALUES (?, ?)", (vid, json.dumps(metadata))
-    )
-    self.conn.commit()
-    return vid
+      ### write-ahead record (fsync)
+      self._oplog_append(
+        {"t": "add", "id": int(vid), "vec": vector.tolist(), "md": metadata}
+      )
+
+      ### do the work
+      self.index.add_items(vector.reshape(1, -1), np.array([vid], dtype=np.int32))
+      self._insert_metadata(vid, metadata)
+
+      ### clear oplog on success (truncate)
+      self._oplog_clear()
+      return vid
 
   def add_many(
     self, vectors: np.ndarray | Sequence[Sequence[float]], metadatas: Sequence[dict]
   ) -> List[int]:
-    """
-    Batch insert. Faster for both HNSW and SQLite.
-    Returns the assigned ids in order.
-    """
-    V = np.asarray(vectors, dtype=np.float32)
-    if V.ndim != 2 or V.shape[1] != self.dim:
-      raise ValueError(f"Expected vectors of shape (n, {self.dim}), got {V.shape}")
-    if len(metadatas) != V.shape[0]:
-      raise ValueError(
-        f"metadatas length {len(metadatas)} != number of vectors {V.shape[0]}"
+    with self._lock:
+      n = vectors.shape[0]
+      self._ensure_capacity(n)
+      ids = np.arange(self._next_id, self._next_id + n, dtype=int)
+      self._next_id += n
+      # write N records into the oplog before mutating state
+      self._oplog_append_many(
+        {"t": "add", "id": int(i), "vec": vectors[j].tolist(), "md": metadatas[j]}
+        for j, i in enumerate(ids)
       )
-
-    n = V.shape[0]
-    self._ensure_capacity(n)
-    ids = np.arange(self._next_id, self._next_id + n, dtype=int)
-    self._next_id += n
-
-    # Add to HNSW in one shot
-    self.index.add_items(V, ids)
-
-    # Batch insert metadata
-    cur = self.conn.cursor()
-    cur.executemany(
-      "INSERT INTO metadata (id, data) VALUES (?, ?)",
-      [(int(i), json.dumps(md)) for i, md in zip(ids, metadatas)],
-    )
-    self.conn.commit()
-    return [int(i) for i in ids]
+      # HNSW first, then metadata
+      self.index.add_items(vectors, ids.astype(np.int32, copy=False))
+      cur = self.conn.cursor()
+      cur.executemany(
+        "INSERT INTO metadata (id, data) VALUES (?, ?)",
+        [(int(i), json.dumps(md)) for i, md in zip(ids, metadatas)],
+      )
+      self.conn.commit()
+      self._oplog_clear()
+      return [int(i) for i in ids]
 
   def query(self, vector: np.ndarray, k: int = 5, ef: int | None = None):
     vector = np.asarray(vector, dtype=np.float32)
@@ -189,3 +194,103 @@ class NoPokeDB:
     """
     self.save()
     self.conn.close()
+
+  # ---- Oplog & Replay ----
+  def _oplog_append(self, rec: dict) -> None:
+    """
+    Append one JSONL record and fsync to ensure durability.
+    """
+    os.makedirs(self.path, exist_ok=True)
+    with open(self.oplog_path, "ab", buffering=0) as f:
+      line = (json.dumps(rec) + "\n").encode("utf-8")
+      f.write(line)
+      f.flush()
+      os.fsync(f.fileno())
+
+  def _oplog_append_many(self, records: Iterable[dict]) -> None:
+    """
+    Append many records with a single fsync.
+    """
+    os.makedirs(self.path, exist_ok=True)
+    buf = io.BytesIO()
+    for rec in records:
+      buf.write((json.dumps(rec) + "\n").encode("utf-8"))
+    data = buf.getvalue()
+    with open(self.oplog_path, "ab", buffering=0) as f:
+      f.write(data)
+      f.flush()
+      os.fsync(f.fileno())
+
+  def _oplog_clear(self) -> None:
+    """
+    Atomically truncate the oplog after successful commits.
+    """
+    # write empty tmp and replace to avoid partial truncation
+    tmp = self.oplog_path + ".tmp"
+    with open(tmp, "wb") as f:
+      f.flush()
+      os.fsync(f.fileno())
+    os.replace(tmp, self.oplog_path)
+
+  def _replay_oplog(self) -> None:
+    if not os.path.exists(self.oplog_path):
+      return
+    # read all lines first
+    try:
+      with open(self.oplog_path, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    except FileNotFoundError:
+      return
+    if not lines:
+      return
+    # build a quick set of ids present in index, to allow idempotent replays
+    try:
+      present_ids = set(map(int, self.index.get_ids_list()))
+    except Exception:
+      present_ids = set()
+
+    self._ensure_capacity(len(lines))
+    for ln in lines:
+      try:
+        op = json.loads(ln)
+      except Exception:
+        continue
+      if not isinstance(op, dict) or op.get("t") != "add":
+        continue
+      vid = int(op["id"])
+      vec = np.asarray(op["vec"], dtype=np.float32).reshape(1, -1)
+      if vec.shape[1] != self.dim:
+        # corrupted or mismatched oplog entry -> skip
+        continue
+      md = op.get("md", {}) if op.get("md", None) is not None else {}
+      have_md = self._metadata_exists(vid)
+      in_index = vid in present_ids
+      # 4 cases:
+      # 1) none exist -> add to index + insert metadata
+      # 2) index only -> insert metadata
+      # 3) metadata only -> add to index
+      # 4) both exist -> nothing to do
+      if not in_index and not have_md:
+        # add to index (strict: raise on failure so tests catch it)
+        self.index.add_items(vec, np.array([vid], dtype=np.int32))
+        present_ids.add(vid)
+        self._insert_metadata(vid, md)
+      elif in_index and not have_md:
+        self._insert_metadata(vid, md)
+      elif (not in_index) and have_md:
+        self.index.add_items(vec, np.array([vid], dtype=np.int32))
+        present_ids.add(vid)
+    # replay finished -> clear oplog
+    self._oplog_clear()
+
+  def _metadata_exists(self, vid: int) -> bool:
+    cur = self.conn.cursor()
+    cur.execute("SELECT 1 FROM metadata WHERE id=?", (vid,))
+    return cur.fetchone() is not None
+
+  def _insert_metadata(self, vid: int, metadata: dict) -> None:
+    cur = self.conn.cursor()
+    cur.execute(
+      "INSERT INTO metadata (id, data) VALUES (?, ?)", (vid, json.dumps(metadata))
+    )
+    self.conn.commit()
