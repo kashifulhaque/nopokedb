@@ -2,6 +2,6 @@
 NoPokeDB
 """
 
-__version__ = "0.1.2"
+__version__ = "0.20"
 
 from .core import NoPokeDB
