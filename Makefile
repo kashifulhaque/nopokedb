@@ -22,7 +22,7 @@ PYEXE   := $(shell command -v python >/dev/null 2>&1 && echo python || (command 
 RUNPY    := $(if $(filter 1,$(HAS_UV)),uv run $(PYEXE),$(PYEXE))
 PYTEST   := $(if $(filter 1,$(HAS_UV)),uv run pytest,pytest)
 RUFF     := $(if $(filter 1,$(HAS_UV)),uv run ruff,ruff)
-BUILDCMD := $(if $(filter 1,$(HAS_UVX)),uvx build,$(RUNPY) -m build)
+BUILDCMD := $(if $(filter 1,$(HAS_UVX)),uvx --from build pyproject-build,$(RUNPY) -m build)
 TWINECMD := $(if $(filter 1,$(HAS_UVX)),uvx twine,$(if $(filter 1,$(HAS_UV)),uv run twine,twine))
 
 # ---- Allow both styles: `make bump V=1.2.3` OR `make bump 1.2.3` ----
