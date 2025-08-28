@@ -110,3 +110,17 @@ endif
 # Swallow the second word when using `make bump 0.5.1`
 %:
 	@:
+
+# --- Benchmarks ---
+.PHONY: bench-np bench-faiss bench-all
+BENCH := benchmarks/bench.py
+
+bench-np:
+	@uv run python $(BENCH) --backend nopokedb --metric cosine --n 20000 --q 200 --dim 128 --k 10
+
+bench-faiss:
+	@uv run python $(BENCH) --backend faiss --metric cosine --n 20000 --q 200 --dim 128 --k 10
+
+bench-all:
+	@$(MAKE) bench-np
+	@$(MAKE) bench-faiss
