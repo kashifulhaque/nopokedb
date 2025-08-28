@@ -1,22 +1,37 @@
-# Makefile
+# Makefile (portable macOS/Linux)
 
-# read version from pyproject.toml
-VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+# ---- Config ----
+PKG          := nopokedb
+INIT_FILE    := src/$(PKG)/__init__.py
+
+# Detect OS for sed -i portability
+UNAME_S      := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+  SED_INPLACE := sed -i ''
+else
+  SED_INPLACE := sed -i
+endif
 
 .PHONY: bump
+# Usage: make bump V=0.5.1
 bump:
-	@[ -n "$(V)" ] || (echo "Use V=0.1.2"; exit 1)
-	sed -i 's/^version = ".*"/version = "$(V)"/' pyproject.toml
-	sed -i 's/^__version__ = ".*"/__version__ = "$(V)"/' src/nopokedb/__init__.py
-	git add .
-	git commit -m "Bump to v$(V)"
-	git tag v$(V)
-	git push origin main --tags
+	@[ -n "$(V)" ] || (echo "Usage: make bump V=<new-version>"; exit 1)
+	@echo "Bumping version to $(V)"
+	@$(SED_INPLACE) -E 's/^version = ".*"/version = "$(V)"/' pyproject.toml
+	@$(SED_INPLACE) -E 's/^__version__ = ".*"/__version__ = "$(V)"/' $(INIT_FILE)
+	@git add pyproject.toml $(INIT_FILE)
+	@git commit -m "Bump to v$(V)" || echo "nothing to commit"
+	@git tag -f v$(V)
+	@git push origin main --tags
 
 .PHONY: publish
 publish:
-	python -m build
-	twine upload \
+	@python -m build
+	@twine upload \
 	  -u __token__ \
-	  -p $(PYPI_API_KEY) \
+	  -p "$(PYPI_API_KEY)" \
 	  dist/*
+
+.PHONY: test
+test:
+	@pytest -q
