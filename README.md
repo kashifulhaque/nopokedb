@@ -1,5 +1,7 @@
 # 🐹 NoPokeDB
 
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/nopokedb?period=total&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=GREY&left_text=pip+installs)](https://pepy.tech/projects/nopokedb)
+
 A **tiny, disk-backed vector database** built on [hnswlib](https://github.com/nmslib/hnswlib) (for approximate nearest neighbor search) and SQLite (for metadata).  
 Simple, lightweight, and crash-safe — good for prototypes, side projects, or when you don’t want a heavyweight vector DB service.
 
